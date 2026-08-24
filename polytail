@@ -40,30 +40,51 @@ seed() {
 }
 
 nets() { seed; awk '!/^[[:space:]]*(#|$)/ {print $1}' "$CONF"; }
+
+# Names reach file paths, launchd labels, plist XML and PAC, so they are
+# checked once here, in the main shell, where a failure can actually stop us.
+check_conf() {
+  local n
+  while read -r n; do
+    [[ $n =~ ^[a-z0-9][a-z0-9-]*$ ]] || die "bad tailnet name '$n' in $CONF (want [a-z0-9-])"
+  done < <(nets)
+}
 fld() { awk -v n="$1" -v f="$2" '$1==n {print $f; exit}' "$CONF"; }
 port() { fld "$1" 2; }
 sfx() { fld "$1" 3; }
 canary() { local c; c=$(fld "$1" 4); [[ $c == - ]] || echo "$c"; }
 pick() { if (($#)); then printf '%s\n' "$@"; else nets; fi; }
+is_ip() { [[ $1 =~ ^[0-9]+(\.[0-9]+){3}$ || $1 == *:*:* ]]; }
 
 # A name belongs to one tailnet or none. Never fall back: that is how you land
 # on the wrong customer's host. rc 2 = explained on stderr, rc 1 = unowned.
 owner() {
-  local h=${1%.} n s
+  local h=${1%.} n s hit=() short=()
   h=$(tr '[:upper:]' '[:lower:]' <<<"$h")
   if [[ $h == 100.100.100.100 ]]; then
     echo "polytail: 100.100.100.100 is the resolver in every tailnet" >&2; return 2
   fi
-  if [[ $h =~ ^[0-9.]+$ || $h == *:* ]]; then
+  if is_ip "$h"; then
     echo "polytail: $h is a raw address and 100.64/10 is per-tailnet; pass -n <net>" >&2; return 2
   fi
   for n in $(nets); do
     s=$(sfx "$n")
-    [[ $s != - && $h == *".$s" ]] && { echo "$n ${h%.$s}"; return; }
+    [[ $s != - && $h == *".$s" ]] && { hit+=("$n"); short+=("${h%.$s}"); }
   done
-  for n in $(nets); do
-    [[ $h == *".$n" ]] && { echo "$n ${h%.$n}"; return; }
-  done
+  # Synthetic aliases are consulted only if no real suffix claimed the name.
+  if ((${#hit[@]} == 0)); then
+    for n in $(nets); do
+      [[ $h == *".$n" ]] && { hit+=("$n"); short+=("${h%.$n}"); }
+    done
+  fi
+  if ((${#hit[@]} > 1)); then
+    echo "polytail: '$h' matches ${hit[*]}; disambiguate with -n" >&2; return 2
+  fi
+  ((${#hit[@]} == 1)) && { echo "${hit[0]} ${short[0]}"; return; }
+  # An unrecognised tailnet suffix must not fall through to an alias guess.
+  if [[ $h == *.ts.net ]]; then
+    echo "polytail: no configured tailnet owns '$h'" >&2; return 2
+  fi
   return 1
 }
 
@@ -71,6 +92,7 @@ owner() {
 
 spawn() {
   local n=$1 p; p=$(port "$n")
+  umask 077
   [[ $p =~ ^[0-9]+$ ]] && ((p > 0)) || die "no socks port for '$n' in $CONF"
   mkdir -p "$(sdir "$n")" "$LOGDIR"; chmod 700 "$(sdir "$n")"
   if [[ -f $(plist "$n") ]]; then
@@ -131,10 +153,13 @@ stop() {
 }
 
 install_agent() {
+  [[ $(uname) == Darwin ]] || die "install writes LaunchAgents; on Linux use a systemd user unit"
   local n p
+  umask 077
   for n in $(pick "$@"); do
     p=$(port "$n"); [[ $p =~ ^[0-9]+$ ]] && ((p > 0)) || die "no socks port for '$n'"
     mkdir -p "$HOME/Library/LaunchAgents" "$LOGDIR" "$(sdir "$n")"
+    chmod 700 "$(sdir "$n")"
     cat >"$(plist "$n")" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -175,6 +200,7 @@ uninstall_agent() {
 
 resolve() {
   local n=$1 h=$2 ip
+  is_ip "$h" && { echo "$h"; return; }
   # Short name only. An FQDN goes to the system resolver, which knows just the
   # GUI client's tailnet, so cross-tailnet lookups fail.
   ip=$(ts "$n" ip -4 "${h%%.*}" 2>/dev/null) || return 1
@@ -182,10 +208,15 @@ resolve() {
 }
 
 route() {
-  local n h res rc
+  local n h res rc on
   if [[ ${1:-} == -n ]]; then
-    n=$2 h=${3%%.*}
+    n=$2 h=${3:?host}
     [[ -n $(port "$n") ]] || die "unknown net '$n'"
+    if res=$(owner "$h" 2>/dev/null); then
+      read -r on h <<<"$res"
+      # An explicit qualifier must never be overridden by -n.
+      [[ $on == "$n" ]] || die "'$3' belongs to '$on', not '$n'"
+    elif ! is_ip "$h"; then h=${h%%.*}; fi
   else
     res=$(owner "${1:?host}"); rc=$?
     ((rc == 2)) && exit 1
@@ -230,11 +261,21 @@ cmd_pac() {
   local n s p body=
   for n in $(nets); do
     s=$(sfx "$n"); p=$(port "$n"); [[ $s == - ]] && continue
-    body+="  if (dnsDomainIs(host, \".$s\") || shExpMatch(host, \"*.$n\"))
+    # Real MagicDNS suffixes only. A synthetic .<net> alias is not a DNS name,
+    # and matching one here would send unrelated public traffic to a tailnet.
+    body+="  if (dnsDomainIs(host, \".$s\"))
     return \"PROXY 127.0.0.1:$((p + 1)); SOCKS5 127.0.0.1:$p\";
 "
   done
   local pac="function FindProxyForURL(url, host) {
+  host = host.toLowerCase();
+  // 100.64/10, quad100 and the ULA prefix are identical in every tailnet, so
+  // no literal can be routed. Dead proxy rather than DIRECT, which would leak
+  // to whichever tailnet the system client happens to be on.
+  var v4 = host.match(/^(\\d+)\\.(\\d+)\\.\\d+\\.\\d+$/);
+  if (host == \"100.100.100.100\") return \"PROXY 127.0.0.1:1\";
+  if (v4 && v4[1] == 100 && v4[2] >= 64 && v4[2] <= 127) return \"PROXY 127.0.0.1:1\";
+  if (host.indexOf(\"fd7a:115c:a1e0:\") == 0) return \"PROXY 127.0.0.1:1\";
 $body  return \"DIRECT\";
 }"
   [[ ${1:-} != serve ]] && { echo "$pac"; return; }
@@ -270,20 +311,32 @@ cmd_run() {
   [[ ${1:-} == -n ]] || die "usage: polytail run -n <net> -- <cmd>..."
   local net=$2 s h; shift 2; [[ ${1:-} == -- ]] && shift
   read -r s h <<<"$(proxy_env "$net")"
-  ALL_PROXY=$s all_proxy=$s HTTP_PROXY=$h HTTPS_PROXY=$h \
+  NO_PROXY= no_proxy= ALL_PROXY=$s all_proxy=$s HTTP_PROXY=$h HTTPS_PROXY=$h \
     http_proxy=$h https_proxy=$h exec "$@"
 }
 
 cmd_validate() {
-  local n s p rc=0 seen=
+  local n s p rc=0 sfxs= ports= q
   [[ -x $TS ]] || { printf '%smissing %s%s\n' "$r" "$TS" "$x"; rc=1; }
   [[ -x $TSD ]] || { printf '%smissing %s%s\n' "$r" "$TSD" "$x"; rc=1; }
   for n in $(nets); do
     s=$(sfx "$n"); p=$(port "$n")
-    [[ $s == - ]] && { printf '%s%s: no suffix, run `polytail up %s`%s\n' "$y" "$n" "$n" "$x"; rc=1; }
-    [[ $p =~ ^[0-9]+$ ]] && ((p > 0)) || { printf '%s%s: no socks port%s\n' "$r" "$n" "$x"; rc=1; }
-    [[ $seen == *"|$s|"* ]] && { printf '%s%s: suffix %s already claimed%s\n' "$r" "$n" "$s" "$x"; rc=1; }
-    seen="$seen|$s|"
+    if [[ $s == - ]]; then
+      printf '%s%s: no suffix, run `polytail up %s`%s\n' "$y" "$n" "$n" "$x"; rc=1
+    elif [[ ! $s =~ ^[a-z0-9][a-z0-9.-]*$ ]]; then
+      printf '%s%s: bad suffix %s%s\n' "$r" "$n" "$s" "$x"; rc=1
+    elif [[ $sfxs == *"|$s|"* ]]; then
+      printf '%s%s: suffix %s already claimed%s\n' "$r" "$n" "$s" "$x"; rc=1
+    fi
+    sfxs="$sfxs|$s|"
+    if [[ ! $p =~ ^[0-9]+$ ]] || ((p < 1024 || p > 65534)); then
+      printf '%s%s: socks port must be 1024-65534%s\n' "$r" "$n" "$x"; rc=1; continue
+    fi
+    # Each tailnet binds p and p+1, so adjacent assignments collide.
+    for q in "$p" "$((p + 1))"; do
+      [[ $ports == *"|$q|"* ]] && { printf '%s%s: port %s already bound%s\n' "$r" "$n" "$q" "$x"; rc=1; }
+      ports="$ports|$q|"
+    done
   done
   ((rc)) || printf '%sok: %s tailnets, no conflicts%s\n' "$g" "$(nets | wc -l | tr -d ' ')" "$x"
   return $rc
@@ -293,7 +346,9 @@ cmd_validate() {
 
 expiry_days() {
   [[ -z ${1:-} || $1 == null ]] && { echo -; return; }
-  local e; e=$(date -j -f '%Y-%m-%dT%H:%M:%SZ' "${1%%.*}Z" +%s 2>/dev/null) || { echo '?'; return; }
+  local t=${1%%.*} e
+  e=$(date -j -f '%Y-%m-%dT%H:%M:%SZ' "${t}Z" +%s 2>/dev/null) ||
+    e=$(date -u -d "${t}Z" +%s 2>/dev/null) || { echo '?'; return; }
   echo $(((e - $(date +%s)) / 86400))
 }
 
@@ -337,39 +392,81 @@ cmd_status() {
 # tailscale ping is a DISCO probe, not ICMP: it reports the path the tailnet
 # would take. The canary TCP dial is what proves a service answers.
 cmd_ping() {
-  local want=${1:-} tmp n; tmp=$(mktemp -d)
-  trap "rm -rf '$tmp'" EXIT INT TERM
-  for n in $(nets); do
-    [[ -S $(sock "$n") ]] || continue
+  local sel=() want= res rc n tmp
+  if [[ ${1:-} == -n ]]; then
+    sel=("$2"); want=${3:-}
+    [[ -n $(port "${sel[0]}") ]] || die "unknown net '${sel[0]}'"
+    if [[ -n $want ]] && res=$(owner "$want" 2>/dev/null); then
+      read -r n want <<<"$res"
+      [[ $n == "${sel[0]}" ]] || die "'$3' belongs to '$n', not '${sel[0]}'"
+    fi
+  elif [[ -n ${1:-} ]]; then
+    want=$1
+    res=$(owner "$want"); rc=$?
+    ((rc == 2)) && return 1
+    # A qualified name probes only its owner. A bare short name probes every
+    # tailnet on purpose, which is how you compare colliding hostnames.
+    ((rc == 0)) && { read -r n want <<<"$res"; sel=("$n"); }
+  fi
+  ((${#sel[@]})) || { while read -r n; do sel+=("$n"); done < <(nets); }
+  ((${#sel[@]})) || die "no tailnets configured in $CONF"
+
+  tmp=$(mktemp -d); trap "rm -rf '$tmp'" EXIT INT TERM
+  for n in "${sel[@]}"; do
     (
-      local h=${want%%.*} cp= c out svc=- ip
+      local h=${want%%.*} cp= c out svc=- ip st line
+      if [[ ! -S $(sock "$n") ]]; then
+        printf '%s\tdown\t-\tno daemon; run `polytail up %s`\n' "$n" "$n" >"$tmp/$n"; exit
+      fi
+      st=$(ts "$n" status --json 2>/dev/null | jq -r '.BackendState // empty')
+      if [[ -z $st ]]; then
+        printf '%s\tdown\t-\tdaemon unreachable (stale socket)\n' "$n" >"$tmp/$n"; exit
+      fi
+      if [[ $st != Running ]]; then
+        printf '%s\tdown\t-\tbackend %s\n' "$n" "$st" >"$tmp/$n"; exit
+      fi
       if [[ -z $h ]]; then
         c=$(canary "$n")
         if [[ -n $c ]]; then h=${c%%:*} cp=${c##*:}
         else h=$(ts "$n" status --json 2>/dev/null |
           jq -r 'first(.Peer[]?|select(.Online)|.DNSName) // empty' | cut -d. -f1); fi
       fi
-      [[ -z $h ]] && exit 0
-      out=$(ts "$n" ping --c 1 --timeout 5s "$h" 2>&1 | head -1)
-      if [[ -n $cp && $out == pong* ]]; then
+      [[ -z $h ]] && { printf '%s\tdown\t-\tno canary and no online peer\n' "$n" >"$tmp/$n"; exit; }
+      # Early probes often relay before a direct path is negotiated, so keep
+      # the last pong rather than the first.
+      out=
+      while read -r line; do [[ $line == pong* ]] && out=$line; done \
+        < <(ts "$n" ping --c 5 --timeout 5s "$h" 2>&1)
+      if [[ -z $out ]]; then
+        printf '%s\tfail\t%s\tno pong within 5s\n' "$n" "$h" >"$tmp/$n"; exit
+      fi
+      if [[ -n $cp ]]; then
         ip=$(resolve "$n" "$h")
         if [[ -n $ip ]] && : | timeout 5 "$TS" --socket="$(sock "$n")" nc "$ip" "$cp" &>/dev/null
         then svc="tcp/$cp ok"; else svc="tcp/$cp FAIL"; fi
       fi
-      printf '%s\t%s\t%s\t%s\n' "$n" "$h" "$out" "$svc" >"$tmp/$n"
+      printf '%s\tok\t%s\t%s\t%s\n' "$n" "$h" "$out" "$svc" >"$tmp/$n"
     ) &
   done
   wait
+
   printf '%s%-10s %-20s %-8s %-32s %s%s\n' "$b" TAILNET TARGET RTT PATH SERVICE "$x"
-  local f rc=0 h out svc rtt via sc
-  for f in "$tmp"/*; do
-    [[ -e $f ]] || continue
-    IFS=$'\t' read -r n h out svc <"$f"
-    if [[ $out != pong* ]]; then
-      printf '%s%-10s%s %-20s %-8s %s\n' "$r" "$n" "$x" "$h" fail "${out:0:48}"; rc=1; continue
+  local rc=0 st h out svc rtt via sc
+  for n in "${sel[@]}"; do
+    if [[ ! -f $tmp/$n ]]; then
+      printf '%s%-10s%s %-20s %s\n' "$r" "$n" "$x" - "probe produced no result"; rc=1; continue
+    fi
+    IFS=$'\t' read -r n st h out svc <"$tmp/$n"
+    if [[ $st != ok ]]; then
+      printf '%s%-10s%s %-20s %-8s %s\n' "$r" "$n" "$x" "$h" "$st" "${out:0:48}"; rc=1; continue
     fi
     rtt=${out##*in } via=${out#*via } via=${via%% in *}
-    [[ $via == DERP* ]] || via="direct $via"
+    case $via in
+      DERP*) ;;
+      *relay*) ;;
+      *:*) via="direct $via" ;;
+      *) via="unrecognised: $via"; rc=1 ;;
+    esac
     sc=$g; [[ $svc == *FAIL ]] && { sc=$r; rc=1; }
     printf '%s%-10s%s %-20s %-8s %-32s %s%s%s\n' \
       "$g" "$n" "$x" "$h" "$rtt" "${via:0:32}" "$sc" "$svc" "$x"
@@ -382,7 +479,7 @@ usage() {
 usage: polytail <command> [args]
 
   status                    state, node, peers, key expiry, proxy per tailnet
-  ping [host]               DISCO path + canary TCP dial, every tailnet at once
+  ping [-n net] [host]      DISCO path + canary TCP dial, every tailnet at once
   own <host>                which tailnet owns a name; fails closed
   validate                  suffix and port conflicts, missing binaries
 
@@ -398,9 +495,11 @@ EOF
   exit 64
 }
 
+check_conf
+
 case ${1:-status} in
   status) shift; cmd_status ;;
-  ping) shift; cmd_ping "${1:-}" ;;
+  ping) shift; cmd_ping "$@" ;;
   own) shift; cmd_own "$@" ;;
   connect) shift; cmd_connect "$@" ;;
   ssh-config) shift; cmd_ssh_config ;;

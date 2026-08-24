@@ -51,9 +51,18 @@ $ polytail own 100.100.100.100
 polytail: 100.100.100.100 is the resolver in every tailnet
 ```
 
-It fails closed. A name resolves in exactly one tailnet or in none. There is no
-fallback to a second tailnet, because that is how you land on the wrong
-customer's host.
+It fails closed, and the rules are worth stating exactly:
+
+- Real MagicDNS suffixes are checked before synthetic `.<name>` aliases.
+- A name matching two tailnets is refused, not resolved to the first.
+- An unrecognised `*.ts.net` name is refused rather than reinterpreted as an
+  alias.
+- An explicit qualifier beats `-n`: `connect -n work db.client-a 22` is an
+  error, not a silent connection to `work`'s `db`.
+- Raw addresses need `-n`, and `100.100.100.100` is refused outright.
+
+A name resolves in exactly one tailnet or in none. There is never a fallback to
+a second tailnet, because that is how you land on the wrong customer's host.
 
 ## Coexistence
 
@@ -116,7 +125,7 @@ to distinguish "the tailnet is up" from "the thing I need is reachable".
 
 ```
 status                    state, node, peers, key expiry, proxy per tailnet
-ping [host]               DISCO path + canary TCP dial, every tailnet at once
+ping [-n net] [host]      DISCO path + canary TCP dial, every tailnet at once
 own <host>                which tailnet owns a name; fails closed
 validate                  suffix and port conflicts, missing binaries
 
@@ -154,6 +163,13 @@ eval "$(polytail env -n work)"
 polytail pac serve      # then point the browser at http://127.0.0.1:1099/proxy.pac
 ```
 
+The generated PAC routes by real MagicDNS suffix only, never by the synthetic
+alias, since an alias is not a DNS name and a tailnet named after a real TLD
+would otherwise capture public traffic. Addresses in `100.64/10`,
+`fd7a:115c:a1e0::/48`, and `100.100.100.100` are sent to a dead proxy rather
+than `DIRECT`, because going direct would leak them to whichever tailnet the
+system client is on.
+
 `run` and `env` are scoped to one command or one shell. There is deliberately no
 persistent "current tailnet": hidden state is the ambiguity this tool exists to
 remove.
@@ -167,10 +183,12 @@ multicast, ping, subnet routes, or programs that ignore proxy settings. Keep
 those on the GUI client.
 
 `ping` reports Tailscale's DISCO probe, not ICMP. A `DERP(...)` path is a pass;
-DERP is a valid route, just a relayed one.
+DERP is a valid route, just a relayed one. `tcp/22 ok` means a TCP connection
+was accepted at that instant, not that the service behind it is healthy.
 
 macOS is what this is tested on. The daemon flags and `ssh_config` generation
-are portable to Linux; the `install` command writes LaunchAgents and is not.
+are portable to Linux, but `install` writes LaunchAgents and refuses to run
+elsewhere; a systemd user unit is not written yet.
 
 ## Alternatives
 
