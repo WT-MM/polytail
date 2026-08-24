@@ -1,0 +1,417 @@
+#!/usr/bin/env bash
+# polytail: use several Tailscale tailnets at once.
+set -uo pipefail
+
+TS=${POLYTAIL_TS:-/opt/homebrew/bin/tailscale}
+TSD=${POLYTAIL_TSD:-/opt/homebrew/bin/tailscaled}
+DIR=${POLYTAIL_DIR:-$HOME/.config/polytail}
+CONF=$DIR/nets.conf
+KH=$DIR/known_hosts
+LOGDIR=${POLYTAIL_LOGDIR:-$HOME/Library/Logs/polytail}
+PAC_PORT=${POLYTAIL_PAC_PORT:-1099}
+
+if [[ -t 1 ]]; then
+  b=$'\033[1m' d=$'\033[2m' r=$'\033[31m' g=$'\033[32m' y=$'\033[33m' x=$'\033[0m'
+else b= d= r= g= y= x=; fi
+
+die() { printf '%spolytail: %s%s\n' "$r" "$*" "$x" >&2; exit 1; }
+sdir() { echo "$HOME/.tailscale-$1"; }
+sock() { echo "$(sdir "$1")/tailscaled.sock"; }
+lbl() { echo "app.polytail.$1"; }
+plist() { echo "$HOME/Library/LaunchAgents/$(lbl "$1").plist"; }
+ts() { local n=$1; shift; "$TS" --socket="$(sock "$n")" "$@"; }
+pid_of() { pgrep -f "statedir=$(sdir "$1")( |$)" | head -1; }
+
+seed() {
+  [[ -f $CONF ]] && return
+  mkdir -p "$DIR" "$KH"
+  { echo "# <name> <socks-port> <magicdns-suffix> [canary host:port]"
+    local dd n p s
+    for dd in "$HOME"/.tailscale-*; do
+      [[ -d $dd ]] || continue
+      n=${dd##*/.tailscale-}
+      p=$(ps -o args= -ax | awk -v s="$dd" '$0 ~ ("statedir=" s) {
+        if (match($0,/socks5-server=[^ ]*/)) { v=substr($0,RSTART,RLENGTH)
+        sub(/.*:/,"",v); print v; exit } }')
+      s=$("$TS" --socket="$dd/tailscaled.sock" status --json 2>/dev/null | jq -r '.MagicDNSSuffix // "-"')
+      echo "$n ${p:-0} ${s:--} -"
+    done
+  } >"$CONF"
+}
+
+nets() { seed; awk '!/^[[:space:]]*(#|$)/ {print $1}' "$CONF"; }
+fld() { awk -v n="$1" -v f="$2" '$1==n {print $f; exit}' "$CONF"; }
+port() { fld "$1" 2; }
+sfx() { fld "$1" 3; }
+canary() { local c; c=$(fld "$1" 4); [[ $c == - ]] || echo "$c"; }
+pick() { if (($#)); then printf '%s\n' "$@"; else nets; fi; }
+
+# A name belongs to one tailnet or none. Never fall back: that is how you land
+# on the wrong customer's host. rc 2 = explained on stderr, rc 1 = unowned.
+owner() {
+  local h=${1%.} n s
+  h=$(tr '[:upper:]' '[:lower:]' <<<"$h")
+  if [[ $h == 100.100.100.100 ]]; then
+    echo "polytail: 100.100.100.100 is the resolver in every tailnet" >&2; return 2
+  fi
+  if [[ $h =~ ^[0-9.]+$ || $h == *:* ]]; then
+    echo "polytail: $h is a raw address and 100.64/10 is per-tailnet; pass -n <net>" >&2; return 2
+  fi
+  for n in $(nets); do
+    s=$(sfx "$n")
+    [[ $s != - && $h == *".$s" ]] && { echo "$n ${h%.$s}"; return; }
+  done
+  for n in $(nets); do
+    [[ $h == *".$n" ]] && { echo "$n ${h%.$n}"; return; }
+  done
+  return 1
+}
+
+# ---------------------------------------------------------------- lifecycle
+
+spawn() {
+  local n=$1 p; p=$(port "$n")
+  [[ $p =~ ^[0-9]+$ ]] && ((p > 0)) || die "no socks port for '$n' in $CONF"
+  mkdir -p "$(sdir "$n")" "$LOGDIR"; chmod 700 "$(sdir "$n")"
+  if [[ -f $(plist "$n") ]]; then
+    launchctl kickstart -k "gui/$(id -u)/$(lbl "$n")" 2>/dev/null && return
+  fi
+  nohup "$TSD" --tun=userspace-networking --statedir="$(sdir "$n")" \
+    --socket="$(sock "$n")" --port=0 --socks5-server=127.0.0.1:"$p" \
+    --outbound-http-proxy-listen=127.0.0.1:$((p + 1)) >>"$LOGDIR/$n.log" 2>&1 &
+  disown
+  local i; for i in $(seq 40); do [[ -S $(sock "$n") ]] && return; sleep 0.25; done
+  die "$n: no socket after 10s, see $LOGDIR/$n.log"
+}
+
+learn_suffix() {
+  local n=$1 s
+  [[ $(sfx "$n") == - ]] || return
+  s=$(ts "$n" status --json 2>/dev/null | jq -r '.MagicDNSSuffix // "-"')
+  [[ $s == - ]] && return
+  awk -v n="$n" -v s="$s" '$1==n {$3=s} {print}' "$CONF" >"$CONF.new" && mv "$CONF.new" "$CONF"
+}
+
+up() {
+  local n
+  for n in $(pick "$@"); do
+    [[ -S $(sock "$n") ]] || spawn "$n"
+    case $(ts "$n" status --json 2>/dev/null | jq -r '.BackendState // "?"') in
+      Running) printf '%s%s up%s\n' "$g" "$n" "$x" ;;
+      NeedsLogin | NoState)
+        ts "$n" up --hostname="$(hostname -s)-$n" --accept-dns=false --accept-routes=false ;;
+      # Bare `up` reconnects and keeps stored prefs; a subset of non-default
+      # flags makes tailscale refuse and demand the full set.
+      *) ts "$n" up && printf '%s%s up%s\n' "$g" "$n" "$x" ;;
+    esac
+    learn_suffix "$n"
+  done
+}
+
+# down leaves the daemon resident, so reconnect needs no re-auth. stop kills it.
+down() {
+  local n
+  for n in $(pick "$@"); do
+    [[ -S $(sock "$n") ]] || { printf '%s%s not running%s\n' "$d" "$n" "$x"; continue; }
+    ts "$n" down 2>/dev/null && printf '%s down\n' "$n"
+  done
+}
+
+stop() {
+  local n p
+  for n in $(pick "$@"); do
+    if [[ -f $(plist "$n") ]] && launchctl print "gui/$(id -u)/$(lbl "$n")" &>/dev/null; then
+      launchctl bootout "gui/$(id -u)/$(lbl "$n")" 2>/dev/null
+      printf '%s stopped\n' "$n"; continue
+    fi
+    p=$(pid_of "$n")
+    [[ -z $p ]] && { printf '%s%s not running%s\n' "$d" "$n" "$x"; continue; }
+    kill "$p" && printf '%s stopped\n' "$n"
+  done
+}
+
+install_agent() {
+  local n p
+  for n in $(pick "$@"); do
+    p=$(port "$n"); [[ $p =~ ^[0-9]+$ ]] && ((p > 0)) || die "no socks port for '$n'"
+    mkdir -p "$HOME/Library/LaunchAgents" "$LOGDIR" "$(sdir "$n")"
+    cat >"$(plist "$n")" <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+  <key>Label</key><string>$(lbl "$n")</string>
+  <key>ProgramArguments</key><array>
+    <string>$TSD</string>
+    <string>--tun=userspace-networking</string>
+    <string>--statedir=$(sdir "$n")</string>
+    <string>--socket=$(sock "$n")</string>
+    <string>--port=0</string>
+    <string>--socks5-server=127.0.0.1:$p</string>
+    <string>--outbound-http-proxy-listen=127.0.0.1:$((p + 1))</string>
+  </array>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+  <key>ThrottleInterval</key><integer>10</integer>
+  <key>StandardOutPath</key><string>$LOGDIR/$n.log</string>
+  <key>StandardErrorPath</key><string>$LOGDIR/$n.err.log</string>
+</dict></plist>
+PLIST
+    plutil -lint "$(plist "$n")" >/dev/null || die "$n: bad plist"
+    p=$(pid_of "$n"); [[ -n $p ]] && kill "$p"
+    launchctl bootout "gui/$(id -u)/$(lbl "$n")" 2>/dev/null
+    launchctl bootstrap "gui/$(id -u)" "$(plist "$n")" && printf '%s%s installed%s\n' "$g" "$n" "$x"
+  done
+}
+
+uninstall_agent() {
+  local n
+  for n in $(pick "$@"); do
+    launchctl bootout "gui/$(id -u)/$(lbl "$n")" 2>/dev/null
+    rm -f "$(plist "$n")" && printf '%s uninstalled\n' "$n"
+  done
+}
+
+# ------------------------------------------------------------------ routing
+
+resolve() {
+  local n=$1 h=$2 ip
+  # Short name only. An FQDN goes to the system resolver, which knows just the
+  # GUI client's tailnet, so cross-tailnet lookups fail.
+  ip=$(ts "$n" ip -4 "${h%%.*}" 2>/dev/null) || return 1
+  [[ -n $ip ]] && echo "$ip"
+}
+
+route() {
+  local n h res rc
+  if [[ ${1:-} == -n ]]; then
+    n=$2 h=${3%%.*}
+    [[ -n $(port "$n") ]] || die "unknown net '$n'"
+  else
+    res=$(owner "${1:?host}"); rc=$?
+    ((rc == 2)) && exit 1
+    ((rc == 0)) || die "no tailnet owns '$1'; use <host>.<net> or -n <net>"
+    read -r n h <<<"$res"
+  fi
+  echo "$n $h"
+}
+
+cmd_own() {
+  local res rc
+  res=$(owner "${1:?usage: polytail own <host>}"); rc=$?
+  ((rc == 2)) && return 1
+  ((rc == 0)) || { printf '%sno tailnet owns %s%s\n' "$y" "$1" "$x"; return 1; }
+  read -r n h <<<"$res"
+  printf '%s%s%s  %s.%s\n' "$g" "$n" "$x" "$h" "$(sfx "$n")"
+}
+
+cmd_connect() {
+  local n h ip
+  read -r n h <<<"$(route "$@")"
+  ip=$(resolve "$n" "$h") || die "$n: cannot resolve $h"
+  exec "$TS" --socket="$(sock "$n")" nc "$ip" "${@: -1}"
+}
+
+cmd_ssh_config() {
+  local n s self; self=$(cd "$(dirname "$0")" && pwd)/$(basename "$0")
+  mkdir -p "$KH"
+  echo "# generated by polytail; include from ~/.ssh/config:"
+  echo "#   Include $DIR/ssh_config"
+  for n in $(nets); do
+    s=$(sfx "$n"); [[ $s == - ]] && continue
+    : >>"$KH/$n"; chmod 600 "$KH/$n"
+    printf '\nHost *.%s *.%s\n    ProxyCommand %s connect %%h %%p\n    UserKnownHostsFile %s\n' \
+      "$n" "$s" "$self" "$KH/$n"
+  done
+  printf '\n# Short names are absent on purpose: they collide across tailnets.\n'
+  printf '# Use host.<net> or the full MagicDNS name.\n'
+}
+
+cmd_pac() {
+  local n s p body=
+  for n in $(nets); do
+    s=$(sfx "$n"); p=$(port "$n"); [[ $s == - ]] && continue
+    body+="  if (dnsDomainIs(host, \".$s\") || shExpMatch(host, \"*.$n\"))
+    return \"PROXY 127.0.0.1:$((p + 1)); SOCKS5 127.0.0.1:$p\";
+"
+  done
+  local pac="function FindProxyForURL(url, host) {
+$body  return \"DIRECT\";
+}"
+  [[ ${1:-} != serve ]] && { echo "$pac"; return; }
+  printf '%shttp://127.0.0.1:%s/proxy.pac%s\n' "$d" "$PAC_PORT" "$x" >&2
+  PAC="$pac" PORT="$PAC_PORT" python3 -c '
+import os, http.server
+pac = os.environ["PAC"].encode()
+class H(http.server.BaseHTTPRequestHandler):
+    def do_GET(s):
+        s.send_response(200)
+        s.send_header("Content-Type", "application/x-ns-proxy-autoconfig")
+        s.send_header("Content-Length", str(len(pac)))
+        s.end_headers(); s.wfile.write(pac)
+    def log_message(s, *a): pass
+http.server.HTTPServer(("127.0.0.1", int(os.environ["PORT"])), H).serve_forever()'
+}
+
+proxy_env() {
+  local p; p=$(port "$1"); [[ $p =~ ^[0-9]+$ ]] && ((p > 0)) || die "unknown net '$1'"
+  # socks5h so the proxy resolves the name, not the local host.
+  echo "socks5h://127.0.0.1:$p" "http://127.0.0.1:$((p + 1))"
+}
+
+cmd_env() {
+  [[ ${1:-} == -n ]] || die "usage: polytail env -n <net>"
+  read -r s h <<<"$(proxy_env "$2")"
+  echo "export ALL_PROXY=$s all_proxy=$s"
+  echo "export HTTP_PROXY=$h HTTPS_PROXY=$h http_proxy=$h https_proxy=$h"
+}
+
+# Scoped to one command. There is deliberately no persistent "current tailnet".
+cmd_run() {
+  [[ ${1:-} == -n ]] || die "usage: polytail run -n <net> -- <cmd>..."
+  local net=$2 s h; shift 2; [[ ${1:-} == -- ]] && shift
+  read -r s h <<<"$(proxy_env "$net")"
+  ALL_PROXY=$s all_proxy=$s HTTP_PROXY=$h HTTPS_PROXY=$h \
+    http_proxy=$h https_proxy=$h exec "$@"
+}
+
+cmd_validate() {
+  local n s p rc=0 seen=
+  [[ -x $TS ]] || { printf '%smissing %s%s\n' "$r" "$TS" "$x"; rc=1; }
+  [[ -x $TSD ]] || { printf '%smissing %s%s\n' "$r" "$TSD" "$x"; rc=1; }
+  for n in $(nets); do
+    s=$(sfx "$n"); p=$(port "$n")
+    [[ $s == - ]] && { printf '%s%s: no suffix, run `polytail up %s`%s\n' "$y" "$n" "$n" "$x"; rc=1; }
+    [[ $p =~ ^[0-9]+$ ]] && ((p > 0)) || { printf '%s%s: no socks port%s\n' "$r" "$n" "$x"; rc=1; }
+    [[ $seen == *"|$s|"* ]] && { printf '%s%s: suffix %s already claimed%s\n' "$r" "$n" "$s" "$x"; rc=1; }
+    seen="$seen|$s|"
+  done
+  ((rc)) || printf '%sok: %s tailnets, no conflicts%s\n' "$g" "$(nets | wc -l | tr -d ' ')" "$x"
+  return $rc
+}
+
+# ---------------------------------------------------------------- reporting
+
+expiry_days() {
+  [[ -z ${1:-} || $1 == null ]] && { echo -; return; }
+  local e; e=$(date -j -f '%Y-%m-%dT%H:%M:%SZ' "${1%%.*}Z" +%s 2>/dev/null) || { echo '?'; return; }
+  echo $(((e - $(date +%s)) / 86400))
+}
+
+probe() {
+  local l=$1 s=$2 j
+  if [[ $s == - ]]; then j=$("$TS" status --json 2>/dev/null)
+  elif [[ -S $s ]]; then j=$("$TS" --socket="$s" status --json 2>/dev/null); fi
+  [[ -z $j ]] && { printf '%s\toffline\t-\t-\t-\t-\t-\tnull\n' "$l"; return; }
+  jq -r --arg l "$l" '(.Self.UserID|tostring) as $u |
+    [ $l, .BackendState, (.MagicDNSSuffix // "-"),
+      ((.Self.DNSName // "-")|split(".")[0]),
+      (.Self.TailscaleIPs[0] // "-"),
+      ([.Peer[]?|select(.Online)]|length|tostring)+"/"+((.Peer//{})|length|tostring),
+      ((.User[$u].LoginName) // "-"), (.Self.KeyExpiry // "null") ] | @tsv' <<<"$j"
+}
+
+cmd_status() {
+  local rows=("$(probe 'system(gui)' -)") n
+  for n in $(nets); do rows+=("$(probe "$n" "$(sock "$n")")"); done
+  printf '%s%-12s %-9s %-12s %-20s %-16s %-8s %-7s %s%s\n' "$b" \
+    TAILNET STATE TAILNET-ID NODE ADDRESS PEERS EXPIRY PROXY "$x"
+  local ok=0 tot=0 seen= row login=- st s node ip peers exp
+  for row in "${rows[@]}"; do
+    IFS=$'\t' read -r n st s node ip peers login exp <<<"$row"
+    ((tot++))
+    local c=$r; case $st in Running) c=$g; ((ok++)) ;; Stopped | NeedsLogin) c=$y ;; esac
+    local days ec= dup= pr=-
+    days=$(expiry_days "$exp")
+    [[ $days =~ ^[0-9]+$ ]] && ((days < 14)) && ec=$y
+    [[ $s != - && $seen == *"|$s|"* ]] && dup=" ${d}dup${x}"; seen="$seen|$s|"
+    if [[ $n == 'system(gui)' ]]; then pr='system utun'
+    else local p; p=$(port "$n"); [[ $p =~ ^[0-9]+$ ]] && ((p > 0)) && pr="socks5://127.0.0.1:$p"; fi
+    printf '%s%-12s %-9s%s %-12s %-20s %-16s %-8s %s%-7s%s %s%s\n' \
+      "$c" "$n" "$st" "$x" "${s%.ts.net}" "$node" "$ip" "$peers" "$ec" "${days}d" "$x" "$pr" "$dup"
+  done
+  printf '%s%d/%d up, tailscale %s, %s%s\n' "$d" "$ok" "$tot" \
+    "$("$TS" version 2>/dev/null | head -1)" "$login" "$x"
+  ((ok == tot))
+}
+
+# tailscale ping is a DISCO probe, not ICMP: it reports the path the tailnet
+# would take. The canary TCP dial is what proves a service answers.
+cmd_ping() {
+  local want=${1:-} tmp n; tmp=$(mktemp -d)
+  trap "rm -rf '$tmp'" EXIT INT TERM
+  for n in $(nets); do
+    [[ -S $(sock "$n") ]] || continue
+    (
+      local h=${want%%.*} cp= c out svc=- ip
+      if [[ -z $h ]]; then
+        c=$(canary "$n")
+        if [[ -n $c ]]; then h=${c%%:*} cp=${c##*:}
+        else h=$(ts "$n" status --json 2>/dev/null |
+          jq -r 'first(.Peer[]?|select(.Online)|.DNSName) // empty' | cut -d. -f1); fi
+      fi
+      [[ -z $h ]] && exit 0
+      out=$(ts "$n" ping --c 1 --timeout 5s "$h" 2>&1 | head -1)
+      if [[ -n $cp && $out == pong* ]]; then
+        ip=$(resolve "$n" "$h")
+        if [[ -n $ip ]] && : | timeout 5 "$TS" --socket="$(sock "$n")" nc "$ip" "$cp" &>/dev/null
+        then svc="tcp/$cp ok"; else svc="tcp/$cp FAIL"; fi
+      fi
+      printf '%s\t%s\t%s\t%s\n' "$n" "$h" "$out" "$svc" >"$tmp/$n"
+    ) &
+  done
+  wait
+  printf '%s%-10s %-20s %-8s %-32s %s%s\n' "$b" TAILNET TARGET RTT PATH SERVICE "$x"
+  local f rc=0 h out svc rtt via sc
+  for f in "$tmp"/*; do
+    [[ -e $f ]] || continue
+    IFS=$'\t' read -r n h out svc <"$f"
+    if [[ $out != pong* ]]; then
+      printf '%s%-10s%s %-20s %-8s %s\n' "$r" "$n" "$x" "$h" fail "${out:0:48}"; rc=1; continue
+    fi
+    rtt=${out##*in } via=${out#*via } via=${via%% in *}
+    [[ $via == DERP* ]] || via="direct $via"
+    sc=$g; [[ $svc == *FAIL ]] && { sc=$r; rc=1; }
+    printf '%s%-10s%s %-20s %-8s %-32s %s%s%s\n' \
+      "$g" "$n" "$x" "$h" "$rtt" "${via:0:32}" "$sc" "$svc" "$x"
+  done
+  return $rc
+}
+
+usage() {
+  cat >&2 <<'EOF'
+usage: polytail <command> [args]
+
+  status                    state, node, peers, key expiry, proxy per tailnet
+  ping [host]               DISCO path + canary TCP dial, every tailnet at once
+  own <host>                which tailnet owns a name; fails closed
+  validate                  suffix and port conflicts, missing binaries
+
+  connect [-n net] <h> <p>  raw TCP through the owning tailnet (ProxyCommand)
+  run -n <net> -- <cmd>     run a command with that tailnet's proxies
+  env -n <net>              print proxy environment variables
+  ssh-config                ssh stanzas plus per-tailnet known_hosts
+  pac [serve]               proxy auto-config so browsers route by hostname
+
+  up|down|stop [net...]     down keeps the daemon resident, stop kills it
+  install|uninstall [net..] LaunchAgent for reboot persistence
+EOF
+  exit 64
+}
+
+case ${1:-status} in
+  status) shift; cmd_status ;;
+  ping) shift; cmd_ping "${1:-}" ;;
+  own) shift; cmd_own "$@" ;;
+  connect) shift; cmd_connect "$@" ;;
+  ssh-config) shift; cmd_ssh_config ;;
+  pac) shift; cmd_pac "$@" ;;
+  env) shift; cmd_env "$@" ;;
+  run) shift; cmd_run "$@" ;;
+  validate) shift; cmd_validate ;;
+  up) shift; up "$@" ;;
+  down) shift; down "$@" ;;
+  stop) shift; stop "$@" ;;
+  install) shift; install_agent "$@" ;;
+  uninstall) shift; uninstall_agent "$@" ;;
+  *) usage ;;
+esac

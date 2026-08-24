@@ -1,0 +1,4 @@
+nets.conf
+known_hosts/
+ssh_config
+*.log

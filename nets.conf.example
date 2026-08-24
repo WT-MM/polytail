@@ -1,0 +1,7 @@
+# <name> <socks-port> <magicdns-suffix> [canary host:port]
+#
+# The HTTP proxy listens on the SOCKS port plus one. Leave the suffix as "-"
+# and `polytail up` fills it in after the first login. The canary is a host:port
+# that should always answer, dialled by `polytail ping`.
+work     1055  tailbbbbbb.ts.net  build01:22
+client-a 1065  tailcccccc.ts.net  gateway:22
