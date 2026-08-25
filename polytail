@@ -383,12 +383,15 @@ cmd_status() {
     local c=$r; case $st in Running) c=$g; ((ok++)) ;; Stopped | NeedsLogin) c=$y ;; esac
     local days ec= dup= pr=-
     days=$(expiry_days "$exp")
-    [[ $days =~ ^[0-9]+$ ]] && ((days < 14)) && ec=$y
+    if [[ $days =~ ^[0-9]+$ ]]; then
+      ((days < 14)) && ec=$y
+      days="${days}d"
+    fi
     [[ $s != - && $seen == *"|$s|"* ]] && dup=" ${d}dup${x}"; seen="$seen|$s|"
     if [[ $n == 'system(gui)' ]]; then pr='system utun'
     else local p; p=$(port "$n"); [[ $p =~ ^[0-9]+$ ]] && ((p > 0)) && pr="socks5://127.0.0.1:$p"; fi
     printf '%s%-12s %-9s%s %-12s %-20s %-16s %-8s %s%-7s%s %s%s\n' \
-      "$c" "$n" "$st" "$x" "${s%.ts.net}" "$node" "$ip" "$peers" "$ec" "${days}d" "$x" "$pr" "$dup"
+      "$c" "$n" "$st" "$x" "${s%.ts.net}" "$node" "$ip" "$peers" "$ec" "$days" "$x" "$pr" "$dup"
   done
   printf '%s%d/%d up, tailscale %s, %s%s\n' "$d" "$ok" "$tot" \
     "$("$TS" version 2>/dev/null | head -1)" "$login" "$x"
