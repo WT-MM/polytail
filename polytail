@@ -182,8 +182,14 @@ install_agent() {
 </dict></plist>
 PLIST
     plutil -lint "$(plist "$n")" >/dev/null || die "$n: bad plist"
-    p=$(pid_of "$n"); [[ -n $p ]] && kill "$p"
+    # Unload before killing: a KeepAlive agent would otherwise be restarted by
+    # launchd between the kill and the bootstrap.
     launchctl bootout "gui/$(id -u)/$(lbl "$n")" 2>/dev/null
+    if p=$(pid_of "$n") && [[ -n $p ]]; then
+      kill "$p"
+      local i; for i in $(seq 25); do pid_of "$n" >/dev/null || break; sleep 0.2; done
+      pid_of "$n" >/dev/null && die "$n: pid $p will not exit; stop it before installing"
+    fi
     launchctl bootstrap "gui/$(id -u)" "$(plist "$n")" && printf '%s%s installed%s\n' "$g" "$n" "$x"
   done
 }
