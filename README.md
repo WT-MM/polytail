@@ -91,8 +91,13 @@ separate from the App Store client.
 
 ```sh
 git clone https://github.com/WT-MM/polytail
-install -m 755 polytail/polytail /usr/local/bin/polytail
+ln -s "$PWD/polytail/polytail" ~/.local/bin/polytail   # or anywhere on PATH
 ```
+
+A symlink means `git pull` takes effect with no reinstall. Note that
+`/usr/local/bin/tailscale` may be the App Store client's launcher rather than
+the open-source CLI, so `polytail` defaults to `/opt/homebrew/bin/tailscale`.
+Override with `POLYTAIL_TS` and `POLYTAIL_TSD` if yours live elsewhere.
 
 ## Setup
 
