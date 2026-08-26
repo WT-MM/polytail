@@ -179,6 +179,19 @@ system client is on.
 persistent "current tailnet": hidden state is the ambiguity this tool exists to
 remove.
 
+## Logs
+
+Under a LaunchAgent, `tailscaled` writes to stderr, so the interesting file is
+`~/Library/Logs/polytail/<net>.err.log`; the `.log` beside it stays empty.
+Expect roughly 2 MB per tailnet per day, mostly `RAW-STDERR` lines where
+`tailscaled` echoes its own logtail JSON. Nothing rotates these; that is left
+to `newsyslog` or your own housekeeping.
+
+`wg: Failed to derive keypair: invalid state for keypair derivation:
+handshakeZeroed` appears periodically and is normal: a handshake expired while a
+packet was still queued for an idle peer. Judge health with `polytail ping`, not
+by grepping logs.
+
 ## What this does not do
 
 Userspace networking is a proxy, not a tunnel. Only proxy-aware and
