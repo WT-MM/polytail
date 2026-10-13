@@ -4,9 +4,9 @@ Use several Tailscale tailnets at once, from one machine.
 
 The official client holds many profiles but only one can be active. Switching is
 global: it drops every connection through the old tailnet and rewrites your
-routes and DNS. If you work across a company tailnet, a lab, and two customer
-networks, you switch constantly and you are never sure which one a command just
-went to.
+routes and DNS. If you have more than one tailnet (your own, one a friend or
+family member shares with you, another for a homelab or side project), you
+switch constantly and you are never sure which one a command just went to.
 
 `polytail` runs one userspace `tailscaled` per tailnet and routes by name
 ownership, so all of them stay reachable at the same time.
@@ -15,13 +15,13 @@ ownership, so all of them stay reachable at the same time.
 $ polytail status
 TAILNET      STATE     TAILNET-ID   NODE            ADDRESS         PEERS   EXPIRY  PROXY
 system(gui)  Running   tailaaaaaa   laptop          100.73.81.74    18/34   84d     system utun
-work         Running   tailbbbbbb   laptop-work     100.67.71.52    17/48   180d    socks5://127.0.0.1:1055
-client-a     Running   tailcccccc   laptop-client-a 100.94.140.7    26/40   180d    socks5://127.0.0.1:1065
+home         Running   tailbbbbbb   laptop-home     100.67.71.52    17/48   180d    socks5://127.0.0.1:1055
+lab          Running   tailcccccc   laptop-lab      100.94.140.7    26/40   180d    socks5://127.0.0.1:1065
 
 $ polytail ping
 TAILNET    TARGET          RTT     PATH                        SERVICE
-work       build01         6ms     direct 192.168.1.244:41641   tcp/22 ok
-client-a   gateway         48ms    DERP(nyc)                    tcp/22 ok
+home       nas             6ms     direct 192.168.1.244:41641   tcp/22 ok
+lab        gateway         48ms    DERP(nyc)                    tcp/22 ok
 ```
 
 ## Why names, not addresses
@@ -30,16 +30,16 @@ Tailscale allocates `100.64.0.0/10` per tailnet, so the same address means
 different machines on different tailnets. Every tailnet shares the identical
 `fd7a:115c:a1e0::/48` IPv6 prefix. `100.100.100.100` is the MagicDNS resolver in
 all of them, and the system resolver can only ever serve one. Short hostnames
-collide freely: two tailnets here share seventeen, including three teammates'
-laptops and two hosts called `influxdb`.
+collide freely: two tailnets can easily share a dozen, like two laptops called
+`macbook` and two hosts called `influxdb`.
 
 So there is nothing in an address or a bare hostname that identifies a tailnet.
 `polytail` gives each tailnet ownership of its MagicDNS suffix and a synthetic
 `.<name>` alias, and resolves inside the owning daemon:
 
 ```
-$ polytail own build01.work
-work  build01.tailbbbbbb.ts.net
+$ polytail own nas.home
+home  nas.tailbbbbbb.ts.net
 
 $ polytail own influxdb
 no tailnet owns influxdb
@@ -57,12 +57,12 @@ It fails closed, and the rules are worth stating exactly:
 - A name matching two tailnets is refused, not resolved to the first.
 - An unrecognised `*.ts.net` name is refused rather than reinterpreted as an
   alias.
-- An explicit qualifier beats `-n`: `connect -n work db.client-a 22` is an
-  error, not a silent connection to `work`'s `db`.
+- An explicit qualifier beats `-n`: `connect -n home db.lab 22` is an
+  error, not a silent connection to `home`'s `db`.
 - Raw addresses need `-n`, and `100.100.100.100` is refused outright.
 
 A name resolves in exactly one tailnet or in none. There is never a fallback to
-a second tailnet, because that is how you land on the wrong customer's host.
+a second tailnet, because that is how you land on the wrong machine.
 
 ## Coexistence
 
@@ -106,8 +106,8 @@ it in `~/.config/polytail/nets.conf`:
 
 ```
 # <name> <socks-port> <magicdns-suffix> [canary host:port]
-work     1055  tailbbbbbb.ts.net  build01:22
-client-a 1065  tailcccccc.ts.net  gateway:22
+home     1055  tailbbbbbb.ts.net  nas:22
+lab      1065  tailcccccc.ts.net  gateway:22
 ```
 
 The HTTP proxy is the SOCKS port plus one. Leave the suffix as `-` and
@@ -153,7 +153,7 @@ process and releases the ports.
 ```sh
 polytail ssh-config >> /dev/stdout   # inspect, then:
 echo "Include ~/.config/polytail/ssh_config" >> ~/.ssh/config
-ssh build01.work
+ssh nas.home
 ```
 
 Each tailnet gets its own `known_hosts`, so two machines sharing a hostname stay
@@ -163,8 +163,8 @@ from the generated config.
 ### Other programs
 
 ```sh
-polytail run -n work -- curl http://influxdb:8086/ping
-eval "$(polytail env -n work)"
+polytail run -n home -- curl http://influxdb:8086/ping
+eval "$(polytail env -n home)"
 polytail pac serve      # then point the browser at http://127.0.0.1:1099/proxy.pac
 ```
 
