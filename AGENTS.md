@@ -39,15 +39,62 @@ polytail connect nas.home 5432                           # raw TCP on stdin/stdo
 `polytail run` is scoped to the one command. There is no "current tailnet" to
 switch to, and `eval "$(polytail env -n <net>)"` affects only that shell.
 
+## Setting up and keeping it running
+
+Only do this when asked: these commands change state for every program on the
+machine.
+
+Add a tailnet by appending a line to `~/.config/polytail/nets.conf`:
+
+```
+# <name> <socks-port> <magicdns-suffix> [canary host:port]
+home     1055  -  nas:22
+```
+
+The name is lowercase `[a-z0-9-]`. Each tailnet uses its SOCKS port and the
+port after it, so space them out (1055, 1065, 1075, ...). Leave the suffix as
+`-`; `polytail up` fills it in after login. The canary is optional.
+
+```sh
+polytail validate        # port and suffix conflicts, missing binaries
+polytail up home         # starts the daemon; first time, prints a login URL
+polytail install home    # LaunchAgent: starts at login, restarts if it dies (macOS only)
+polytail status          # confirm Running
+```
+
+The login URL must be opened by the human, signed in as themselves. Don't
+substitute an auth key. After login the machine appears in that tailnet as
+`<hostname>-<net>`.
+
+Without `install` the daemon dies on reboot. With it, launchd keeps it up and
+`polytail up` just restarts it. To make `ssh host.<net>` work without a
+`ProxyCommand`, generate the ssh config once and include it:
+
+```sh
+polytail ssh-config > ~/.config/polytail/ssh_config
+grep -q 'polytail/ssh_config' ~/.ssh/config || echo "Include ~/.config/polytail/ssh_config" >> ~/.ssh/config
+```
+
+`Include` has to come before any `Host` block in `~/.ssh/config`, so check
+where the line landed. Re-run `ssh-config` after adding a tailnet.
+
+Other lifecycle commands:
+
+```sh
+polytail down home       # disconnect, daemon stays resident, reconnect needs no login
+polytail stop home       # kill the daemon
+polytail uninstall home  # remove the LaunchAgent (also stops it)
+```
+
+Logs are in `~/Library/Logs/polytail/<net>.err.log`. Periodic
+`handshakeZeroed` lines there are normal; judge health with `polytail ping`.
+
 ## Limits
 
 - TCP through a proxy only: no UDP, ICMP, subnet routes, or programs that
   ignore `ALL_PROXY`/`HTTP_PROXY`. `ping` will not work; use `polytail ping`.
 - The plain `tailscale` CLI talks to the GUI client's tailnet, not the
   `polytail` ones. Use `polytail` for these tailnets.
-- `polytail up` may print a login URL that a human has to open in a browser.
-  Don't run `up`, `down`, `stop`, `install` or `uninstall` unless asked; they
-  change state for every program on the machine.
 - `polytail ping` reports Tailscale's path probe plus a TCP dial to the canary.
   `tcp/22 ok` means the port accepted a connection, not that the service is
   healthy.
