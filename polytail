@@ -57,7 +57,7 @@ pick() { if (($#)); then printf '%s\n' "$@"; else nets; fi; }
 is_ip() { [[ $1 =~ ^[0-9]+(\.[0-9]+){3}$ || $1 == *:*:* ]]; }
 
 # A name belongs to one tailnet or none. Never fall back: that is how you land
-# on the wrong customer's host. rc 2 = explained on stderr, rc 1 = unowned.
+# on the wrong machine. rc 2 = explained on stderr, rc 1 = unowned.
 owner() {
   local h=${1%.} n s hit=() short=()
   h=$(tr '[:upper:]' '[:lower:]' <<<"$h")

@@ -128,6 +128,9 @@ to distinguish "the tailnet is up" from "the thing I need is reachable".
 
 ## Commands
 
+AI agents: see [AGENTS.md](AGENTS.md) for the short version of how to use this.
+
+
 ```
 status                    state, node, peers, key expiry, proxy per tailnet
 ping [-n net] [host]      DISCO path + canary TCP dial, every tailnet at once
